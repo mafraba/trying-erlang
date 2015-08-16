@@ -75,9 +75,9 @@ stop(Name) ->
   Name ! {stop, self()},
   receive {reply, Reply} -> Reply end.
 
-terminate([{Pid, _} | ChildList]) ->
+terminate([{_ChildId, Pid, _MFA, _Type, _RestartCount} | T]) ->
   exit(Pid, kill),
-  terminate(ChildList);
+  terminate(T);
 terminate(_ChildList) -> ok.
 
 % To support the control of infinite-restart cases we need to also reduce the
