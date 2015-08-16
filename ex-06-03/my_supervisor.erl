@@ -22,7 +22,9 @@ start_children([]) -> [];
 start_children([{Mod, Func, Args, Type} | ChildSpecList]) ->
   case (catch apply(Mod, Func, Args)) of
     {ok, Pid} ->
-      [{Pid, {Mod, Func, Args, Type}}|start_children(ChildSpecList)];
+      ChildId = make_ref(),
+      RestartCount = 0,
+      [{ChildId, Pid, {Mod, Func, Args}, Type, RestartCount}|start_children(ChildSpecList)];
     _ ->
       start_children(ChildSpecList)
   end.
@@ -34,15 +36,20 @@ start_children([{Mod, Func, Args, Type} | ChildSpecList]) ->
 % only upon abnormal termination.
 
 restart_child(Pid, ChildList, Reason) ->
-  {Pid, {M,F,A,T}} = lists:keyfind(Pid, 1, ChildList),
-  case T of
+  {ChildId, Pid, {Mod, Func, Args}, Type, RestartCount} = lists:keyfind(Pid, 2, ChildList),
+  case Type of
     transient when Reason == normal ->
-      io:format("Normal termination of transient child ~w~n",[Pid]),
-      lists:keydelete(Pid,1,ChildList);
+      io:format("Normal termination of transient child ~w~n",[ChildId]),
+      lists:keydelete(ChildId, 1, ChildList);
+    _ when RestartCount > 5 ->
+      io:format("Too many restarts in one minute for ~w~n",[ChildId]),
+      lists:keydelete(ChildId, 1, ChildList);
     _ ->
-      {ok, NewPid} = apply(M,F,A),
-      io:format("Restarting child ~w, now it's ~w~n",[Pid, NewPid]),
-      [{NewPid, {M,F,A,T}}|lists:keydelete(Pid,1,ChildList)]
+      {ok, NewPid} = apply(Mod, Func, Args),
+      io:format("Restarting child ~w~n",[ChildId]),
+      Supervisor = self(),
+      spawn(fun() -> decrement_restart_counter_in_one_minute(Supervisor, ChildId) end),
+      [{ChildId, NewPid, {Mod, Func, Args}, Type, RestartCount+1}|lists:keydelete(ChildId,1,ChildList)]
   end.
 
 loop(ChildList) ->
@@ -50,6 +57,10 @@ loop(ChildList) ->
     {'EXIT', Pid, Reason} ->
       io:format("Got child EXIT: ~w / ~w / ~w~n",[Pid, Reason, ChildList]),
       NewChildList = restart_child(Pid, ChildList, Reason),
+      loop(NewChildList);
+    {decrement_restart_counter, ChildId} ->
+      io:format("Decrementing restart counter for ~w in ~w~n",[ChildId, ChildList]),
+      NewChildList = decrement_restart_counter(ChildId, ChildList),
       loop(NewChildList);
     {stop, From} ->
       From ! {reply, terminate(ChildList)}
@@ -68,3 +79,20 @@ terminate([{Pid, _} | ChildList]) ->
   exit(Pid, kill),
   terminate(ChildList);
 terminate(_ChildList) -> ok.
+
+% To support the control of infinite-restart cases we need to also reduce the
+% counter of restarts for each child one minute after each restart.
+
+decrement_restart_counter_in_one_minute(Supervisor, Child) ->
+  io:format("Timing restart count decrement for ~w~n",[Child]),
+  receive
+    after 10000 ->
+      io:format("Sending signal to ~w to decrement restart counter for ~w~n",[Supervisor, Child]),
+      Supervisor ! {decrement_restart_counter, Child}
+  end.
+
+decrement_restart_counter(_,[]) -> []; % Pid already dead
+decrement_restart_counter(ChildId, [{ChildId,Pid,MFA,Type,Count}|T]) ->
+  [{ChildId,Pid,MFA,Type,Count-1}|T];
+decrement_restart_counter(ChildId, [H|T]) ->
+  [H|decrement_restart_counter(ChildId,T)].
